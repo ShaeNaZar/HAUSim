@@ -7,9 +7,12 @@ Parses the raw SLAM format (en_es.slam.20190204.train) into the canonical event 
 All SLAM tokens are treated as PICK_DEFINITION exercises.
 Context is the full sentence token list (no English level appended).
 
-For repeated loads, call convert_to_parquet() once to write a compact .parquet
-file next to the .train file; subsequent load_duolingo_slam() calls will use it
-automatically and skip the slow text parse entirely.
+The parquet cache always stores the FULL dataset. Pass max_exercises to
+load_duolingo_slam() to slice out the first N exercises after loading —
+the cache is never regenerated for partial reads.
+
+Call convert_to_parquet() once to write the compact cache; subsequent
+load_duolingo_slam() calls use it automatically and skip the slow text parse.
 """
 
 from __future__ import annotations
@@ -31,23 +34,23 @@ def validate_event_frame(df: pd.DataFrame):
     assert isinstance(df['context'].iloc[0], (list, tuple))
 
 
-def _parse_slam_file(path: Path, max_exercises: Optional[int]) -> pd.DataFrame:
+def _parse_slam_file(path: Path) -> pd.DataFrame:
     """
-    Lean parse: only collects the four fields needed for the canonical output.
-    Drops token_id, pos, dep_label, session, format, and token_position at
-    source so they never enter memory.
+    Parse the full .train file. Returns a raw DataFrame with an integer
+    `exercise_num` column (global 0-indexed counter) used for slicing later.
     """
-    user_ids:    list[str]   = []
-    exercise_ids: list[str]  = []
-    days_vals:   list[float] = []
-    tokens:      list[str]   = []
-    labels:      list[int]   = []
+    user_ids:      list[str]   = []
+    exercise_ids:  list[str]   = []
+    exercise_nums: list[int]   = []
+    days_vals:     list[float] = []
+    tokens:        list[str]   = []
+    labels:        list[int]   = []
 
-    current_user = ''
-    current_days = 0.0
-    current_ex_id = ''
+    current_user   = ''
+    current_days   = 0.0
+    current_ex_id  = ''
     exercise_count = 0
-    pending_tokens: list[tuple[str, int]] = []   # (token, label)
+    pending_tokens: list[tuple[str, int]] = []
 
     def flush():
         nonlocal exercise_count
@@ -57,6 +60,7 @@ def _parse_slam_file(path: Path, max_exercises: Optional[int]) -> pd.DataFrame:
         for tok, lbl in pending_tokens:
             user_ids.append(current_user)
             exercise_ids.append(ex_id)
+            exercise_nums.append(exercise_count)
             days_vals.append(current_days)
             tokens.append(tok)
             labels.append(lbl)
@@ -75,15 +79,13 @@ def _parse_slam_file(path: Path, max_exercises: Optional[int]) -> pd.DataFrame:
                     if ':' in part:
                         k, v = part.split(':', 1)
                         kv[k] = v
-                current_user = kv.get('user', '')
-                current_days = float(kv.get('days', 0) or 0)
-                current_ex_id = current_user  # non-empty signals active exercise
-                if max_exercises and exercise_count >= max_exercises:
-                    break
+                current_user  = kv.get('user', '')
+                current_days  = float(kv.get('days', 0) or 0)
+                current_ex_id = current_user
             elif line.strip() == '':
                 flush()
                 pending_tokens = []
-                current_ex_id = ''
+                current_ex_id  = ''
             else:
                 parts = line.split()
                 if len(parts) < 6:
@@ -95,42 +97,63 @@ def _parse_slam_file(path: Path, max_exercises: Optional[int]) -> pd.DataFrame:
     flush()
 
     return pd.DataFrame({
-        'user_id':     pd.array(user_ids,     dtype='category'),
-        'exercise_id': pd.array(exercise_ids, dtype='category'),
-        'days':        pd.array(days_vals,    dtype='float32'),
-        'token':       pd.array(tokens,       dtype='category'),
-        'label':       pd.array(labels,       dtype='int8'),
+        'user_id':      pd.array(user_ids,      dtype='category'),
+        'exercise_id':  pd.array(exercise_ids,  dtype='category'),
+        'exercise_num': pd.array(exercise_nums, dtype='int32'),
+        'days':         pd.array(days_vals,     dtype='float32'),
+        'token':        pd.array(tokens,        dtype='category'),
+        'label':        pd.array(labels,        dtype='int8'),
     })
 
 
 def _build_canonical(raw: pd.DataFrame, ref_ts: int) -> pd.DataFrame:
     raw = raw[raw['label'] >= 0].copy()
 
-    # Build context lists — one list object per exercise, shared across rows.
-    # Sort is disabled for speed; groupby preserves insertion order in pandas >= 2.
     ctx = raw.groupby('exercise_id', sort=False)['token'].apply(list)
     raw = raw.join(ctx.rename('context'), on='exercise_id')
 
     out = pd.DataFrame({
-        'user_id':   raw['user_id'].astype('category'),
-        'word':      raw['token'].astype('category'),
-        'context':   raw['context'],
-        'action':    (raw['label'] == 0),
-        'timestamp': (ref_ts + raw['days'].astype('float64') * 86400).astype('int64'),
+        'exercise_num': raw['exercise_num'],
+        'user_id':      raw['user_id'].astype('category'),
+        'word':         raw['token'].astype('category'),
+        'context':      raw['context'],
+        'action':       (raw['label'] == 0),
+        'timestamp':    (ref_ts + raw['days'].astype('float64') * 86400).astype('int64'),
     })
 
-    validate_event_frame(out)
+    validate_event_frame(out.drop(columns=['exercise_num']))
     return out
+
+
+def _save_parquet(df: pd.DataFrame, path: Path) -> None:
+    import json
+    df_save = df.copy()
+    df_save['context'] = df_save['context'].apply(json.dumps)
+    df_save.to_parquet(path, index=False, compression='zstd')
+
+
+def _load_parquet(path: Path) -> pd.DataFrame:
+    import json
+    df = pd.read_parquet(path)
+    df['context'] = df['context'].apply(json.loads)
+    df['action']  = df['action'].astype(bool)
+    return df
+
+
+def _apply_max_exercises(df: pd.DataFrame, max_exercises: Optional[int]) -> pd.DataFrame:
+    """Keep only the first max_exercises exercises, then drop the helper column."""
+    if max_exercises is not None:
+        df = df[df['exercise_num'] < max_exercises].copy()
+    return df.drop(columns=['exercise_num'])
 
 
 def convert_to_parquet(
     train_path: str | Path,
     out_path: Optional[str | Path] = None,
-    max_exercises: Optional[int] = None,
     ref_ts: int = _DEFAULT_REF_TS,
 ) -> Path:
     """
-    One-time conversion: parse the .train file and write a compact .parquet file.
+    One-time conversion: parse the FULL .train file and write a compact .parquet.
 
     The parquet file is written next to the .train file by default.
     Returns the path of the written file.
@@ -140,24 +163,10 @@ def convert_to_parquet(
         out_path = train_path.with_suffix('.parquet')
     out_path = Path(out_path)
 
-    raw = _parse_slam_file(train_path, max_exercises)
+    raw = _parse_slam_file(train_path)
     df  = _build_canonical(raw, ref_ts)
-
-    # Store context as a JSON string column so parquet round-trips cleanly
-    # without requiring pyarrow list-type support at read time.
-    import json
-    df_save = df.copy()
-    df_save['context'] = df_save['context'].apply(json.dumps)
-    df_save.to_parquet(out_path, index=False, compression='zstd')
+    _save_parquet(df, out_path)
     return out_path
-
-
-def _load_parquet(path: Path) -> pd.DataFrame:
-    import json
-    df = pd.read_parquet(path)
-    df['context'] = df['context'].apply(json.loads)
-    df['action']  = df['action'].astype(bool)
-    return df
 
 
 def load_duolingo_slam(
@@ -169,28 +178,26 @@ def load_duolingo_slam(
     """
     Load a SLAM .train file and return a canonical event DataFrame.
 
-    If a .parquet file with the same stem exists next to the .train file it is
-    loaded directly (fast, low memory).  Otherwise the .train file is parsed;
-    when save_parquet=True the result is written to parquet for future calls.
+    The parquet cache holds the FULL dataset. If it exists it is always used
+    regardless of max_exercises, keeping re-parses out of the hot path.
+    max_exercises slices the first N exercises from the already-loaded data.
 
     path          — path to en_es.slam.20190204.train (or .parquet)
-    max_exercises — cap for faster dev iteration
+    max_exercises — return only the first N exercises (for dev iteration)
     ref_ts        — base Unix timestamp; days-since-study-start are added to it
     save_parquet  — write .parquet on first parse so future loads are instant
     """
-    path = Path(path)
+    path         = Path(path)
     parquet_path = path.with_suffix('.parquet')
 
-    if parquet_path.exists() and max_exercises is None:
-        return _load_parquet(parquet_path)
+    if parquet_path.exists():
+        df = _load_parquet(parquet_path)
+    else:
+        raw = _parse_slam_file(path)
+        df  = _build_canonical(raw, ref_ts)
+        if save_parquet:
+            _save_parquet(df, parquet_path)
 
-    raw = _parse_slam_file(path, max_exercises)
-    df  = _build_canonical(raw, ref_ts)
-
-    if save_parquet and max_exercises is None:
-        import json
-        df_save = df.copy()
-        df_save['context'] = df_save['context'].apply(json.dumps)
-        df_save.to_parquet(parquet_path, index=False, compression='zstd')
-
+    df = _apply_max_exercises(df, max_exercises)
+    validate_event_frame(df)
     return df
