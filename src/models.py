@@ -1,10 +1,15 @@
 """
-Model definitions and training utilities for HSTU / SASRec / ARGUS.
+Model definitions and training utilities for HSTU / ARGUS.
 
-All three architectures share:
+Both architectures share:
   - ContextEncoder with a shared token embedding table
   - The same event embedding: word_emb + context_emb (mean-pool) + action_emb + delta_emb
   - SequentialModel base class, same batch format, same save/load
+
+Loss (both archs):
+  - BCE on action (binary classification)
+  - MSE of sigmoid(logit) vs action_prob where not NaN (soft recall regression)
+  ARGUS additionally uses an in-batch NIP contrastive loss.
 
 Public API
 ----------
@@ -42,8 +47,8 @@ from .sequence_dataset import encode_tokens, log_bucketize_delta
 
 @dataclass
 class ModelConfig:
-    """Unified config for HSTU / SASRec / ARGUS. Set `arch` to switch."""
-    arch: str = 'hstu'          # 'hstu' | 'sasrec' | 'argus'
+    """Unified config for HSTU / ARGUS. Set `arch` to switch."""
+    arch: str = 'hstu'          # 'hstu' | 'argus'
     d_model: int = 64
     n_heads: int = 2
     n_layers: int = 2
@@ -118,40 +123,6 @@ class HSTUBlock(nn.Module):
             a = a.masked_fill(attn_mask[:, None, None], 0.0)
         av = (self.drop(a) @ heads(v)).transpose(1, 2).contiguous().view(B, L, -1)
         return x + self.drop(self.f2(self.norm_post(av) * u))
-
-
-# ── SASRec block ──────────────────────────────────────────────────────────────
-
-class SASRecBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        h, dh, dm = cfg.n_heads, cfg.d_head, cfg.d_model
-        self.h, self.dh, self.scale = h, dh, math.sqrt(dh)
-        self.qkv  = nn.Linear(dm, 3 * dm)
-        self.out  = nn.Linear(dm, dm)
-        self.ff   = nn.Sequential(nn.Linear(dm, 4 * dm), nn.GELU(), nn.Linear(4 * dm, dm))
-        self.n1   = nn.LayerNorm(dm)
-        self.n2   = nn.LayerNorm(dm)
-        self.drop = nn.Dropout(cfg.dropout)
-
-    def forward(self, x, time_bias=None, attn_mask=None):
-        B, L, dm = x.shape
-        qkv = self.qkv(self.n1(x)).chunk(3, dim=-1)
-
-        def heads(t):
-            return t.view(B, L, self.h, self.dh).transpose(1, 2)
-
-        qh, kh, vh = heads(qkv[0]), heads(qkv[1]), heads(qkv[2])
-        s = (qh @ kh.transpose(-1, -2)) / self.scale
-        if time_bias is not None:
-            s = s + time_bias
-        causal = torch.ones(L, L, device=x.device, dtype=torch.bool).triu(1)
-        s = s.masked_fill(causal[None, None], float('-inf'))
-        if attn_mask is not None:
-            s = s.masked_fill(attn_mask[:, None, None], float('-inf'))
-        av = (self.drop(F.softmax(s, -1)) @ vh).transpose(1, 2).contiguous().view(B, L, dm)
-        x = x + self.drop(self.out(av))
-        return x + self.drop(self.ff(self.n2(x)))
 
 
 # ── ARGUS block ───────────────────────────────────────────────────────────────
@@ -246,34 +217,6 @@ class HSTUModel(SequentialModel):
         return self.head(torch.cat([last, tw, tc, td], -1)).squeeze(-1)
 
 
-# ── SASRec model ──────────────────────────────────────────────────────────────
-
-class SASRecModel(SequentialModel):
-    def __init__(self, cfg: ModelConfig, vocab: dict):
-        super().__init__(cfg, vocab)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
-        self.blocks  = nn.ModuleList([SASRecBlock(cfg) for _ in range(cfg.n_layers)])
-        self.head = nn.Sequential(
-            nn.Linear(4 * cfg.d_model, cfg.d_model), nn.GELU(), nn.Linear(cfg.d_model, 1)
-        )
-
-    def encode_history(self, hw, hc, ha, hd):
-        B, L = hw.shape
-        x, pad, tb = self._embed(hw, hc, ha, hd)
-        x = x + self.pos_emb(torch.arange(L, device=hw.device).unsqueeze(0))
-        for blk in self.blocks:
-            x = blk(x, time_bias=tb, attn_mask=pad)
-        return self.final_norm(x)
-
-    def forward(self, batch):
-        last = self.encode_history(batch['hist_word'], batch['hist_context'],
-                                    batch['hist_action'], batch['hist_delta'])[:, -1]
-        tw = self.ctx_enc.encode_word(batch['target_word'])
-        tc = self.ctx_enc.encode_context(batch['target_context'])
-        td = self.delta_emb(batch['target_delta'])
-        return self.head(torch.cat([last, tw, tc, td], -1)).squeeze(-1)
-
-
 # ── ARGUS item tower ──────────────────────────────────────────────────────────
 
 class ItemTower(nn.Module):
@@ -355,10 +298,21 @@ class ARGUSModel(SequentialModel):
 # ── Factory ───────────────────────────────────────────────────────────────────
 
 def build_model(cfg: ModelConfig, vocab: dict) -> SequentialModel:
-    return {'hstu': HSTUModel, 'sasrec': SASRecModel, 'argus': ARGUSModel}[cfg.arch](cfg, vocab)
+    return {'hstu': HSTUModel, 'argus': ARGUSModel}[cfg.arch](cfg, vocab)
 
 
 # ── Loss / train / eval ───────────────────────────────────────────────────────
+
+def prob_regression_loss(logits: torch.Tensor, batch: dict) -> torch.Tensor:
+    """MSE between sigmoid(logits) and target_prob; skipped where target_prob is NaN."""
+    if 'target_prob' not in batch:
+        return logits.new_tensor(0.0)
+    target = batch['target_prob']
+    mask = ~torch.isnan(target)
+    if not mask.any():
+        return logits.new_tensor(0.0)
+    return F.mse_loss(torch.sigmoid(logits[mask]), target[mask])
+
 
 def argus_loss(model: ARGUSModel, batch: dict, nip_weight: Optional[float] = None):
     if nip_weight is None:
@@ -369,14 +323,17 @@ def argus_loss(model: ARGUSModel, batch: dict, nip_weight: Optional[float] = Non
     temp = torch.clamp(model.log_temp.exp(), 0.01, 100.0)
     logits_nip = (nip_user @ nip_item.T) / temp
     nip_loss = F.cross_entropy(logits_nip, torch.arange(B, device=nip_user.device))
-    return fp_loss + nip_weight * nip_loss, fp_loss, nip_loss
+    reg_loss = prob_regression_loss(fp_logits, batch)
+    total = fp_loss + nip_weight * nip_loss + reg_loss
+    return total, fp_loss, nip_loss
 
 
 def compute_loss(model: SequentialModel, batch: dict) -> torch.Tensor:
     if isinstance(model, ARGUSModel):
         total, _, _ = argus_loss(model, batch)
         return total
-    return F.binary_cross_entropy_with_logits(model(batch), batch['target_label'])
+    logits = model(batch)
+    return F.binary_cross_entropy_with_logits(logits, batch['target_label']) + prob_regression_loss(logits, batch)
 
 
 def evaluate(model: SequentialModel, loader, device='cpu') -> dict:
@@ -513,19 +470,15 @@ class HSTUPredictor:
 
     @torch.no_grad()
     def predict_action(self, history: List[HistoryEvent], new_context: List[str],
-                       new_word: str, now_timestamp: float = 0.0,
-                       temperature: float = 1.0) -> float:
+                       new_word: str, now_timestamp: float = 0.0) -> float:
         batch = self._build_batch(history, [(new_word, new_context, 0.0)], now_timestamp)
-        logit = self.model(batch).item()
-        return float(torch.sigmoid(torch.tensor(logit / temperature)).item())
+        return float(torch.sigmoid(self.model(batch)).item())
 
     @torch.no_grad()
     def predict_action_batch(self, history: List[HistoryEvent],
                              candidates: List[Tuple[str, List[str]]],
-                             now_timestamp: float = 0.0,
-                             temperature: float = 1.0) -> List[float]:
+                             now_timestamp: float = 0.0) -> List[float]:
         if not candidates:
             return []
         batch = self._build_batch(history, [(w, c, 0.) for w, c in candidates], now_timestamp)
-        logits = self.model(batch)
-        return torch.sigmoid(logits / temperature).tolist()
+        return torch.sigmoid(self.model(batch)).tolist()

@@ -54,7 +54,7 @@ from sklearn.metrics import log_loss, roc_auc_score
 from .sequence_dataset import encode_tokens, log_bucketize_delta
 from .models import (
     ModelConfig, SequentialModel, ContextEncoder, ItemTower,
-    HistoryEvent, HSTUPredictor, evaluate,
+    HistoryEvent, HSTUPredictor, evaluate, prob_regression_loss,
 )
 
 
@@ -610,7 +610,9 @@ def argus_gpu_loss(model: ARGUSModelGPU, batch: dict,
     sim_reweighted = sim + hard_mask.float() * 0.5  # gentle boost
 
     nip_loss = F.cross_entropy(sim_reweighted, torch.arange(B, device=sim.device))
-    return fp_loss + nip_weight * nip_loss, fp_loss, nip_loss
+    reg_loss = prob_regression_loss(fp_logits, batch)
+    total = fp_loss + nip_weight * nip_loss + reg_loss
+    return total, fp_loss, nip_loss
 
 
 def compute_loss_gpu(model: SequentialModel, batch: dict,
@@ -619,7 +621,8 @@ def compute_loss_gpu(model: SequentialModel, batch: dict,
     if isinstance(model, ARGUSModelGPU):
         total, _, _ = argus_gpu_loss(model, batch)
     else:
-        total = F.binary_cross_entropy_with_logits(model(batch), batch['target_label'])
+        logits = model(batch)
+        total = F.binary_cross_entropy_with_logits(logits, batch['target_label']) + prob_regression_loss(logits, batch)
 
     if isinstance(model, (HSTUModelGPU, ARGUSModelGPU)):
         aux = model.collect_moe_aux_loss()

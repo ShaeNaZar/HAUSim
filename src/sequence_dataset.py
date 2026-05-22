@@ -24,7 +24,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-CANONICAL_COLS = ['user_id', 'word', 'context', 'action', 'timestamp']
+CANONICAL_COLS = ['user_id', 'word', 'context', 'action', 'action_prob', 'timestamp']
 
 
 # ── Preprocessing helpers ──────────────────────────────────────────────────────
@@ -87,6 +87,10 @@ def prepare_events(events: pd.DataFrame, data_cfg, model_cfg) -> tuple[pd.DataFr
     df['delta_bucket'] = df['delta_sec'].map(
         lambda d: log_bucketize_delta(d, model_cfg.n_time_buckets)
     ).astype(np.int64)
+    # NaN for Duolingo rows (no probability); float for synthetic rows
+    if 'action_prob' not in df.columns:
+        df['action_prob'] = np.nan
+    df['action_prob'] = df['action_prob'].astype(np.float32)
 
     return df, vocab
 
@@ -100,6 +104,7 @@ def to_user_sequences(df: pd.DataFrame) -> list[dict]:
             'word_idx':    g['word_idx'].values.astype(np.int64),
             'context_idx': np.array(list(g['context_idx'].values), dtype=np.int64),
             'action':      g['action'].values.astype(np.int64),
+            'action_prob': g['action_prob'].values.astype(np.float32),
             'delta_bucket': g['delta_bucket'].values.astype(np.int64),
             'timestamp':   g['timestamp'].values.astype(np.int64),
         })
@@ -188,6 +193,7 @@ class SequenceWindowDataset(Dataset):
             'target_context': torch.from_numpy(s['context_idx'][t]),
             'target_delta':   torch.tensor(int(s['delta_bucket'][t]),  dtype=torch.long),
             'target_label':   torch.tensor(float(s['action'][t]),      dtype=torch.float32),
+            'target_prob':    torch.tensor(float(s['action_prob'][t]), dtype=torch.float32),
         }
 
 

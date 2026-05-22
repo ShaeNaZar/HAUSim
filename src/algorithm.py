@@ -163,9 +163,11 @@ CEFR_LEVELS = list(_HUMAN_PRESETS.keys())
 
 
 class GreedyFSRSSelector(Selector):
-    def __init__(self, words: dict[str, str], english_level: str = "B1", **kwargs):
+    def __init__(self, words: dict[str, str], english_level: str = "B1",
+                 step_size_days: float = 1 / 1440, **kwargs):
         super().__init__(words, **kwargs)
         self.english_level = english_level
+        self._step_size_days = step_size_days
         preset = _HUMAN_PRESETS.get(english_level.upper(), _HUMAN_PRESETS["B1"])
         self.human = fsrs.Human(human_id=0, **preset)
         self._word_states: dict[str, fsrs.Word] = {}
@@ -179,7 +181,6 @@ class GreedyFSRSSelector(Selector):
 
     def record_attempt(self, exercise: Exercise, is_correct: bool):
         super().record_attempt(exercise, is_correct)
-        # Keep internal FSRS word state in sync so ERG estimates improve over time
         fsrs_word = self._get_or_create_word(exercise.word)
         ex_type = EXERCISE_TYPE_MAP.get(exercise.exercise_class, fsrs.ExerciseType.TRANSLATE_EN_RU)
         if not fsrs_word.seen:
@@ -188,7 +189,7 @@ class GreedyFSRSSelector(Selector):
             base_recall = self.human._compute_retrievability(fsrs_word, self._current_ts)
         grade = 3 if is_correct else 1
         self.human._update_word_state(fsrs_word, grade, self._current_ts, base_recall)
-        self._current_ts += 1 / 1440  # advance by 1 minute per attempt
+        self._current_ts += self._step_size_days
 
     # pick the word+exercise pair that maximises expected recognition growth
     def produce_next_excercise(self) -> Exercise:
@@ -199,7 +200,8 @@ class GreedyFSRSSelector(Selector):
         for word_text in self.words:
             fsrs_word = self._get_or_create_word(word_text)
             for exercise_type in fsrs.ExerciseType:
-                erg = self.human.estimate_erg(fsrs_word, exercise_type, self._current_ts)
+                erg = self.human.estimate_erg(fsrs_word, exercise_type, self._current_ts,
+                                              horizon=self._step_size_days)
                 if erg > best_erg:
                     best_erg = erg
                     best_word_text = word_text

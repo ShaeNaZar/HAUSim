@@ -8,7 +8,11 @@ by combining:
   - Three selector strategies: RandomSelector, QueueSelector, GreedyFSRSSelector
 
 Output: canonical event DataFrame (same schema as slam_loader.py)
-  user_id | word | context: list[str] | action: bool | timestamp: int
+  user_id | word | context: list[str] | action: bool | action_prob: float | timestamp: int
+
+action_prob is the FSRS recall probability at the time of the attempt (used as a
+soft regression target in the combined loss). It is always available for synthetic
+events; Duolingo rows will have NaN after dataset merging.
 
 Context encoding:
   - A randomly chosen half of users receive context = [exercise_class, cefr_level]
@@ -84,7 +88,7 @@ def generate_synthetic_events(
 
     Returns
     -------
-    pd.DataFrame with columns: user_id, word, context, action, timestamp
+    pd.DataFrame with columns: user_id, word, context, action, action_prob, timestamp
     """
     rng = random.Random(seed)
     queue_gen = QueueGenerator()
@@ -150,24 +154,27 @@ def generate_synthetic_events(
 
                 result = sim_human.attempt(fsrs_w, ex_type, current_ts_days)
                 is_correct: bool = result["success"]
+                action_prob: float = result["recall_prob"]
 
                 queue.progress(ex, is_correct)
 
                 context_tokens = [ex.exercise_class, level] if with_ctx else [ex.exercise_class]
 
                 all_rows.append({
-                    "user_id":   user_id,
-                    "word":      ex.word,
-                    "context":   context_tokens,
-                    "action":    is_correct,
-                    "timestamp": int(_BASE_TS + current_ts_days * _DAY),
+                    "user_id":     user_id,
+                    "word":        ex.word,
+                    "context":     context_tokens,
+                    "action":      is_correct,
+                    "action_prob": action_prob,
+                    "timestamp":   int(_BASE_TS + current_ts_days * _DAY),
                 })
 
-                current_ts_days += 1.0 / 1440  # 1 minute per exercise
+                current_ts_days += 1.0
                 step += 1
 
             current_ts_days += session_interval_days
 
     df = pd.DataFrame(all_rows)
     df["action"] = df["action"].astype(bool)
+    df["action_prob"] = df["action_prob"].astype("float32")
     return df
