@@ -1,8 +1,10 @@
+import copy
 import csv
 import os
 import random
 
 from . import fsrs_simulator as fsrs
+from .models import HSTUPredictor, HistoryEvent
 
 # hardness of every exercise
 EXERCESES_COMPLEXITY = {
@@ -213,236 +215,234 @@ class GreedyFSRSSelector(Selector):
         ex.exercise_class = best_exercise_type.code if best_exercise_type else ""
         return ex
 
-class KtoToSeleclot(Selector):
-    def __init__(self, words: dict[str, str], infinite_mode: bool = True,
-                 cnt_words_in_fucher: int = 2,
-                 k: int = 5,
-                 cnt_word_candidates: int | None = None):
-        super().__init__(words, infinite_mode=infinite_mode)
-        self.cnt_words_in_fucher = cnt_words_in_fucher
-        self.k = max(1, k)
-        self.cnt_word_candidates = (
-            max(1, cnt_word_candidates)
-            if cnt_word_candidates is not None
-            else self.k
-        )
-        self.word_candidates: list[str] = []
-        self.word_candidate_scores: list[tuple[str, float]] = []
-        self._candidate_exercise_classes: dict[str, str] = {}
+class BeamSelector(Selector):
+    """
+    2-step lookahead FSRS selector.
 
-    def generate_words_after_correct_choice(
-        self,
-        word: str,
-        exercise_class: str,
-        words_state: dict[str, float] | None = None,
-    ) -> dict[str, float]:
-        return self._generate_words_after_choice(
-            word=word,
-            exercise_class=exercise_class,
-            is_correct=True,
-            words_state=words_state,
-        )
+    For each candidate (word_1, exercise_1) computes:
+      V = ERG_step1 + p_success * best_ERG_step2(state_after_success)
+                    + p_fail    * best_ERG_step2(state_after_failure)
 
-    def generate_words_after_incorrect_choice(
-        self,
-        word: str,
-        exercise_class: str,
-        words_state: dict[str, float] | None = None,
-    ) -> dict[str, float]:
-        return self._generate_words_after_choice(
-            word=word,
-            exercise_class=exercise_class,
-            is_correct=False,
-            words_state=words_state,
-        )
+    Picks the candidate with maximum V. Same ERG metric as GreedyFSRSSelector,
+    but looks one step further ahead.
+    """
 
-    def _generate_words_after_choice(
-        self,
-        word: str,
-        exercise_class: str,
-        is_correct: bool,
-        words_state: dict[str, float] | None = None,
-    ) -> dict[str, float]:
-        current_words = self.words if words_state is None else words_state
-        if word not in current_words:
-            raise ValueError(f"Unknown active word: {word}")
+    def __init__(self, words: dict[str, str], english_level: str = "B1",
+                 step_size_days: float = 1 / 1440, **kwargs):
+        super().__init__(words, **kwargs)
+        self.english_level = english_level
+        self._step_size_days = step_size_days
+        preset = _HUMAN_PRESETS.get(english_level.upper(), _HUMAN_PRESETS["B1"])
+        self.human = fsrs.Human(human_id=0, **preset)
+        self._word_states: dict[str, fsrs.Word] = {}
+        self._current_ts: float = 0.0
 
-        next_words = dict(current_words)
-        if is_correct:
-            gain = EXERCESES_PROGRESS.get(exercise_class, 0.0)
-            next_words[word] = next_words.get(word, 0.0) + gain
+    def _get_or_create_word(self, word_text: str) -> fsrs.Word:
+        if word_text not in self._word_states:
+            wid = len(self._word_states)
+            self._word_states[word_text] = fsrs.Word(word_id=wid, text=word_text, translation="")
+        return self._word_states[word_text]
 
-        if not self.infinite_mode and next_words.get(word, 0.0) >= 1.0:
-            next_words.pop(word, None)
+    def record_attempt(self, exercise: Exercise, is_correct: bool):
+        super().record_attempt(exercise, is_correct)
+        fsrs_word = self._get_or_create_word(exercise.word)
+        ex_type = EXERCISE_TYPE_MAP.get(exercise.exercise_class, fsrs.ExerciseType.TRANSLATE_EN_RU)
+        base_recall = (self.human._first_exposure_recall(fsrs_word, ex_type)
+                       if not fsrs_word.seen
+                       else self.human._compute_retrievability(fsrs_word, self._current_ts))
+        grade = 3 if is_correct else 1
+        self.human._update_word_state(fsrs_word, grade, self._current_ts, base_recall)
+        self._current_ts += self._step_size_days
 
-        return next_words
+    def _word_after_attempt(self, word: fsrs.Word, ex_type: fsrs.ExerciseType,
+                             ts: float, grade: int) -> fsrs.Word:
+        w = copy.copy(word)
+        base_recall = (self.human._first_exposure_recall(w, ex_type)
+                       if not w.seen
+                       else self.human._compute_retrievability(w, ts))
+        self.human._update_word_state(w, grade, ts, base_recall)
+        return w
 
-    def update_word_candidates(self) -> list[str]:
-        beam = self._beam_search(self.words, self.cnt_words_in_fucher)
-        self.word_candidate_scores = [
-            (first_word, score)
-            for score, _, first_word, _ in beam[:self.cnt_word_candidates]
-            if first_word is not None
-        ]
-        self.word_candidates = [word for word, _ in self.word_candidate_scores]
-        self._candidate_exercise_classes = {
-            first_word: first_exercise
-            for _, _, first_word, first_exercise in beam
-            if first_word is not None and first_exercise is not None
-        }
-        return self.word_candidates
-
-    def _beam_search(
-        self,
-        words_state: dict[str, float],
-        depth: int,
-    ) -> list[tuple[float, dict[str, float], str | None, str | None]]:
-        if depth <= 0 or not words_state:
-            return []
-
-        beam: list[tuple[float, dict[str, float], str | None, str | None]] = [
-            (0.0, dict(words_state), None, None)
-        ]
-
-        for _ in range(depth):
-            expanded: list[tuple[float, dict[str, float], str | None, str | None]] = []
-            for score, state, first_word, first_exercise in beam:
-                if not state:
-                    expanded.append((score, state, first_word, first_exercise))
-                    continue
-
-                for word in state:
-                    for exercise_class in _EXERCISE_KEYS:
-                        gain, next_state = self._expected_gain_and_next_state(
-                            word, exercise_class, state
-                        )
-                        expanded.append((
-                            score + gain,
-                            next_state,
-                            first_word or word,
-                            first_exercise or exercise_class,
-                        ))
-
-            if not expanded:
-                break
-            beam = self._prune_beam(expanded)
-
-        return beam
-
-    def _prune_beam(
-        self,
-        beam: list[tuple[float, dict[str, float], str | None, str | None]],
-    ) -> list[tuple[float, dict[str, float], str | None, str | None]]:
-        beam.sort(key=lambda item: item[0], reverse=True)
-
-        pruned = []
-        seen_first_words = set()
-        for item in beam:
-            first_word = item[2]
-            if first_word in seen_first_words:
-                continue
-            pruned.append(item)
-            seen_first_words.add(first_word)
-            if len(pruned) >= self.k:
-                break
-
-        return pruned
-
-    def _expected_gain_and_next_state(
-        self,
-        word: str,
-        exercise_class: str,
-        words_state: dict[str, float],
-    ) -> tuple[float, dict[str, float]]:
-        recognition_before = self._mean_recognition(words_state)
-        p_correct = self._success_probability(word, exercise_class, words_state)
-
-        words_after_correct = self.generate_words_after_correct_choice(
-            word, exercise_class, words_state
-        )
-        words_after_incorrect = self.generate_words_after_incorrect_choice(
-            word, exercise_class, words_state
-        )
-
-        recognition_after_correct = self._mean_recognition(words_after_correct)
-        recognition_after_incorrect = self._mean_recognition(words_after_incorrect)
-        expected_gain = (
-            p_correct * (recognition_after_correct - recognition_before)
-            + (1 - p_correct) * (recognition_after_incorrect - recognition_before)
-        )
-
-        next_state = self._expected_words_after_choice(
-            current_words=words_state,
-            words_after_correct=words_after_correct,
-            words_after_incorrect=words_after_incorrect,
-            p_correct=p_correct,
-        )
-        return expected_gain, next_state
-
-    def _expected_words_after_choice(
-        self,
-        current_words: dict[str, float],
-        words_after_correct: dict[str, float],
-        words_after_incorrect: dict[str, float],
-        p_correct: float,
-    ) -> dict[str, float]:
-        next_words = {}
-        for word in current_words:
-            correct_value = words_after_correct.get(word, 1.0)
-            incorrect_value = words_after_incorrect.get(word, 1.0)
-            expected_value = (
-                p_correct * correct_value
-                + (1 - p_correct) * incorrect_value
-            )
-
-            if self.infinite_mode or expected_value < 1.0:
-                next_words[word] = expected_value
-
-        return next_words
-
-    def _success_probability(
-        self,
-        word: str,
-        exercise_class: str,
-        words_state: dict[str, float],
-    ) -> float:
-        familiarity = self._clamp(words_state.get(word, 0.0), 0.0, 1.0)
-        complexity = EXERCESES_COMPLEXITY.get(exercise_class, 1.0)
-        guess_floor = 0.25 if exercise_class == "PICK_A_WORD" else 0.02
-        learned_probability = self._clamp(familiarity / complexity, 0.0, 1.0)
-        probability = guess_floor + (1 - guess_floor) * learned_probability
-        return self._clamp(probability, 0.0, 1.0)
-
-    def _mean_recognition(self, words_state: dict[str, float]) -> float:
-        if not self._word_levels:
-            return 0.0
-
-        total = 0.0
-        for word in self._word_levels:
-            if word in words_state:
-                total += self._clamp(words_state[word], 0.0, 1.0)
-            else:
-                total += 1.0
-        return total / len(self._word_levels)
-
-    @staticmethod
-    def _clamp(value: float, lower: float, upper: float) -> float:
-        return max(lower, min(upper, value))
+    def _best_erg(self, word_states: dict[str, fsrs.Word], ts: float) -> float:
+        best = -float("inf")
+        for word in word_states.values():
+            for ex_type in fsrs.ExerciseType:
+                erg = self.human.estimate_erg(word, ex_type, ts,
+                                              horizon=self._step_size_days)
+                if erg > best:
+                    best = erg
+        return best if best > -float("inf") else 0.0
 
     def produce_next_excercise(self) -> Exercise:
-        candidates = self.update_word_candidates()
-        word = candidates[0] if candidates else min(self.words, key=self.words.get)
+        for word_text in self.words:
+            self._get_or_create_word(word_text)
+
+        active = {w: self._word_states[w] for w in self.words}
+        ts1 = self._current_ts
+        ts2 = ts1 + self._step_size_days
+
+        best_score = -float("inf")
+        best_word = None
+        best_ex_type = None
+
+        for word_text, word_state in active.items():
+            for ex_type in fsrs.ExerciseType:
+                erg1 = self.human.estimate_erg(word_state, ex_type, ts1,
+                                               horizon=self._step_size_days)
+                p = self.human.success_probability(word_state, ex_type, ts1)
+
+                w_ok  = self._word_after_attempt(word_state, ex_type, ts1, grade=3)
+                w_bad = self._word_after_attempt(word_state, ex_type, ts1, grade=1)
+
+                erg2 = (p       * self._best_erg({**active, word_text: w_ok},  ts2) +
+                        (1 - p) * self._best_erg({**active, word_text: w_bad}, ts2))
+
+                score = erg1 + erg2
+                if score > best_score:
+                    best_score = score
+                    best_word = word_text
+                    best_ex_type = ex_type
 
         ex = Exercise()
-        ex.word = word
+        ex.word = best_word or next(iter(self.words))
         ex.word_class = self.word_class(ex.word)
-        ex.exercise_class = self._candidate_exercise_classes.get(
-            ex.word,
-            max(
-                _EXERCISE_KEYS,
-                key=lambda exercise_class: self._expected_gain_and_next_state(
-                    ex.word, exercise_class, self.words
-                )[0],
-            ),
-        )
+        ex.exercise_class = best_ex_type.code if best_ex_type else ""
+        return ex
+
+
+class GreedyHSTUSelector(Selector):
+    """
+    Greedy ERG selector that splits responsibilities between two models:
+
+    - HSTU predictor  → p_correct  (success probability for the candidate exercise)
+    - FSRS Human      → r_no_review, r_after_success, r_after_failure  (memory state)
+
+    ERG = p_correct * r_after_success + (1 - p_correct) * r_after_failure - r_no_review
+    """
+
+    def __init__(self, words: dict[str, str], predictor: HSTUPredictor,
+                 english_level: str = "B1", step_size_days: float = 1 / 1440, **kwargs):
+        super().__init__(words, **kwargs)
+        self.predictor = predictor
+        self._step_size_days = step_size_days
+        preset = _HUMAN_PRESETS.get(english_level.upper(), _HUMAN_PRESETS["B1"])
+        self.human = fsrs.Human(human_id=0, **preset)
+        self._word_states: dict[str, fsrs.Word] = {}
+        self._history: list[HistoryEvent] = []
+        self._current_ts: float = 0.0
+
+    def _get_or_create_word(self, word_text: str) -> fsrs.Word:
+        if word_text not in self._word_states:
+            wid = len(self._word_states)
+            self._word_states[word_text] = fsrs.Word(word_id=wid, text=word_text, translation="")
+        return self._word_states[word_text]
+
+    def _context(self, word_text: str, exercise_class: str) -> list[str]:
+        return [exercise_class, self.word_class(word_text)]
+
+    def record_attempt(self, exercise: Exercise, is_correct: bool):
+        super().record_attempt(exercise, is_correct)
+        fsrs_word = self._get_or_create_word(exercise.word)
+        ex_type = EXERCISE_TYPE_MAP.get(exercise.exercise_class, fsrs.ExerciseType.TRANSLATE_EN_RU)
+        base_recall = (self.human._first_exposure_recall(fsrs_word, ex_type)
+                       if not fsrs_word.seen
+                       else self.human._compute_retrievability(fsrs_word, self._current_ts))
+        grade = 3 if is_correct else 1
+        self.human._update_word_state(fsrs_word, grade, self._current_ts, base_recall)
+        self._history.append(HistoryEvent(
+            word=exercise.word,
+            context=self._context(exercise.word, exercise.exercise_class),
+            action=is_correct,
+            timestamp=self._current_ts,
+        ))
+        self._current_ts += self._step_size_days
+
+    def produce_next_excercise(self) -> Exercise:
+        best_word = None
+        best_exercise_class = None
+        best_erg = -float("inf")
+
+        ts = self._current_ts
+
+        for word_text in self.words:
+            fsrs_word = self._get_or_create_word(word_text)
+            for exercise_class in _EXERCISE_KEYS:
+                ex_type = EXERCISE_TYPE_MAP.get(exercise_class, fsrs.ExerciseType.TRANSLATE_EN_RU)
+                ctx = self._context(word_text, exercise_class)
+
+                # Success probability from HSTU
+                p_correct = self.predictor.predict_action(
+                    self._history, ctx, word_text, ts
+                )
+
+                # Recognition estimates (r_no_review, r_after_success, r_after_failure) from FSRS
+                r_no_review, r_after_success, r_after_failure = self.human.recognition_estimates(
+                    fsrs_word, ex_type, ts, self._step_size_days
+                )
+
+                erg = (p_correct * r_after_success
+                       + (1 - p_correct) * r_after_failure
+                       - r_no_review)
+
+                if erg > best_erg:
+                    best_erg = erg
+                    best_word = word_text
+                    best_exercise_class = exercise_class
+
+        ex = Exercise()
+        ex.word = best_word or next(iter(self.words))
+        ex.word_class = self.word_class(ex.word)
+        ex.exercise_class = best_exercise_class or _EXERCISE_KEYS[0]
+        return ex
+
+
+class GreedySigmoidSelector(Selector):
+    def __init__(self, words: dict[str, str], english_level: str = "B1",
+                 step_size_days: float = 1 / 1440, **kwargs):
+        super().__init__(words, **kwargs)
+        self.english_level = english_level
+        self._step_size_days = step_size_days
+        preset = _HUMAN_PRESETS.get(english_level.upper(), _HUMAN_PRESETS["B1"])
+        self.human = fsrs.Human(human_id=0, **preset)
+        self._word_states: dict[str, fsrs.Word] = {}
+        self._current_ts: float = 0.0
+
+    def _get_or_create_word(self, word_text: str) -> fsrs.Word:
+        if word_text not in self._word_states:
+            wid = len(self._word_states)
+            self._word_states[word_text] = fsrs.Word(word_id=wid, text=word_text, translation="")
+        return self._word_states[word_text]
+
+    def record_attempt(self, exercise: Exercise, is_correct: bool):
+        super().record_attempt(exercise, is_correct)
+        fsrs_word = self._get_or_create_word(exercise.word)
+        ex_type = EXERCISE_TYPE_MAP.get(exercise.exercise_class, fsrs.ExerciseType.TRANSLATE_EN_RU)
+        if not fsrs_word.seen:
+            base_recall = self.human._first_exposure_recall(fsrs_word, ex_type)
+        else:
+            base_recall = self.human._compute_retrievability(fsrs_word, self._current_ts)
+        grade = 3 if is_correct else 1
+        self.human._update_word_state(fsrs_word, grade, self._current_ts, base_recall)
+        self._current_ts += self._step_size_days
+
+    # pick the word+exercise pair that maximises expected recognition growth
+    def produce_next_excercise(self) -> Exercise:
+        best_word_text = None
+        best_exercise_type = None
+        best_erg = -float("inf")
+
+        for word_text in self.words:
+            fsrs_word = self._get_or_create_word(word_text)
+            for exercise_type in fsrs.ExerciseType:
+                erg = self.human.estimate_sigmoid(fsrs_word, exercise_type, self._current_ts,
+                                              horizon=self._step_size_days)
+                if erg > best_erg:
+                    best_erg = erg
+                    best_word_text = word_text
+                    best_exercise_type = exercise_type
+
+        ex = Exercise()
+        ex.word = best_word_text
+        ex.word_class = self.word_class(best_word_text) if best_word_text else ""
+        ex.exercise_class = best_exercise_type.code if best_exercise_type else ""
         return ex
