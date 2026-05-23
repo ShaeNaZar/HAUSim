@@ -317,12 +317,19 @@ class GreedyHSTUSelector(Selector):
     - HSTU predictor  → p_correct  (success probability for the candidate exercise)
     - FSRS Human      → r_no_review, r_after_success, r_after_failure  (memory state)
 
-    ERG = p_correct * r_after_success + (1 - p_correct) * r_after_failure - r_no_review
+    mode="erg"  — raw retrievability values:
+        ERG = p_correct * r_after_success + (1 - p_correct) * r_after_failure - r_no_review
+    mode="sigm" — shifted-sigmoid applied to each r term (same as GreedySigmoidSelector):
+        ERG = p_correct * σ(r_after_success) + (1 - p_correct) * σ(r_after_failure) - σ(r_no_review)
     """
 
     def __init__(self, words: dict[str, str], predictor: HSTUPredictor,
-                 english_level: str = "B1", step_size_days: float = 1 / 1440, **kwargs):
+                 english_level: str = "B1", step_size_days: float = 1 / 1440,
+                 mode: str = "erg", **kwargs):
         super().__init__(words, **kwargs)
+        if mode not in ("erg", "sigm"):
+            raise ValueError(f"mode must be 'erg' or 'sigm', got {mode!r}")
+        self.mode = mode
         self.predictor = predictor
         self._step_size_days = step_size_days
         preset = _HUMAN_PRESETS.get(english_level.upper(), _HUMAN_PRESETS["B1"])
@@ -379,6 +386,11 @@ class GreedyHSTUSelector(Selector):
                 r_no_review, r_after_success, r_after_failure = self.human.recognition_estimates(
                     fsrs_word, ex_type, ts, self._step_size_days
                 )
+
+                if self.mode == "sigm":
+                    r_no_review    = fsrs.Human._shifted_sigmoid(r_no_review)
+                    r_after_success = fsrs.Human._shifted_sigmoid(r_after_success)
+                    r_after_failure = fsrs.Human._shifted_sigmoid(r_after_failure)
 
                 erg = (p_correct * r_after_success
                        + (1 - p_correct) * r_after_failure
