@@ -15,6 +15,7 @@ import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+import numpy as np
 
 
 # ============================================================
@@ -134,6 +135,41 @@ class Human:
         self._session_position = 0
         self._recent_clusters = []
 
+    def success_probability(self, word: Word, exercise: ExerciseType,
+                            current_ts: float) -> float:
+        """
+        Probability that the learner answers this word correctly now.
+
+        Includes exercise difficulty, fatigue, interference, background error,
+        and typing typos.
+        """
+        base_recall = self._base_recall_probability(word, exercise, current_ts)
+        probability = self._contextual_recall_probability(base_recall, word, exercise)
+        if exercise == ExerciseType.TYPING:
+            probability *= (1 - self.typo_rate)
+        return self._clamp(probability, 0.0, 1.0)
+
+    def failure_probability(self, word: Word, exercise: ExerciseType,
+                            current_ts: float) -> float:
+        """Probability that the learner answers this word incorrectly now."""
+        return 1.0 - self.success_probability(word, exercise, current_ts)
+
+    def retrievability_after_success(self, word: Word, exercise: ExerciseType,
+                                     current_ts: float,
+                                     horizon: float = 1.0) -> float:
+        """R_after_success: retrievability at current_ts + horizon after GOOD."""
+        return self._retrievability_after_grade(
+            word, exercise, current_ts, horizon, grade=3
+        )
+
+    def retrievability_after_failure(self, word: Word, exercise: ExerciseType,
+                                     current_ts: float,
+                                     horizon: float = 1.0) -> float:
+        """R_after_failure: retrievability at current_ts + horizon after AGAIN."""
+        return self._retrievability_after_grade(
+            word, exercise, current_ts, horizon, grade=1
+        )
+
     def attempt(self, word: Word, exercise: ExerciseType, current_ts: float) -> dict:
         """
         Simulate an attempt at an exercise.
@@ -141,16 +177,10 @@ class Human:
         Returns a dict with attempt metadata and updates the word's memory state.
         """
         # 1. Compute recall probability
-        if not word.seen:
-            # First exposure — word is unknown, chance is near zero
-            # (except for cognates and multiple choice where guessing is possible)
-            base_recall = self._first_exposure_recall(word, exercise)
-        else:
-            base_recall = self._compute_retrievability(word, current_ts)
+        base_recall = self._base_recall_probability(word, exercise, current_ts)
 
         # 2. Apply context modifiers
-        recall_prob = self._apply_context_modifiers(base_recall, word, exercise)
-        recall_prob = max(0.0, min(1.0, recall_prob))
+        recall_prob = self._contextual_recall_probability(base_recall, word, exercise)
 
         # 3. Flip the coin
         success = random.random() < recall_prob
@@ -199,6 +229,30 @@ class Human:
         }
 
     # ----- internal methods -----
+
+    def _base_recall_probability(self, word: Word, exercise: ExerciseType,
+                                 current_ts: float) -> float:
+        if not word.seen:
+            # First exposure — word is unknown, chance is near zero
+            # except for cognates and multiple choice where guessing is possible.
+            return self._first_exposure_recall(word, exercise)
+        return self._compute_retrievability(word, current_ts)
+
+    def _contextual_recall_probability(self, base_recall: float, word: Word,
+                                       exercise: ExerciseType) -> float:
+        probability = self._apply_context_modifiers(base_recall, word, exercise)
+        return self._clamp(probability, 0.0, 1.0)
+
+    def _retrievability_after_grade(self, word: Word, exercise: ExerciseType,
+                                    current_ts: float, horizon: float,
+                                    grade: int) -> float:
+        import copy
+
+        r_base = self._base_recall_probability(word, exercise, current_ts)
+        future_ts = current_ts + horizon
+        word_after_attempt = copy.copy(word)
+        self._update_word_state(word_after_attempt, grade, current_ts, r_base)
+        return self._compute_retrievability(word_after_attempt, future_ts)
 
     def _first_exposure_recall(self, word: Word, exercise: ExerciseType) -> float:
         """Probability of guessing correctly on first exposure."""
@@ -305,46 +359,57 @@ class Human:
             return 0.0
         return sum(self._compute_retrievability(w, current_ts) for w in words) / len(words)
 
+    def recognition_estimates(self, word: Word, exercise: ExerciseType,
+                              current_ts: float,
+                              horizon: float = 1.0) -> tuple[float, float, float]:
+        """
+        Return (r_no_review, r_after_success, r_after_failure) at current_ts + horizon.
+
+        r_no_review     — retrievability at horizon if the word is not reviewed now.
+        r_after_success — retrievability at horizon after a correct answer.
+        r_after_failure — retrievability at horizon after an incorrect answer.
+        """
+        future_ts = current_ts + horizon
+        r_no_review = self._compute_retrievability(word, future_ts) if word.seen else 0.0
+        r_after_success = self.retrievability_after_success(word, exercise, current_ts, horizon)
+        r_after_failure = self.retrievability_after_failure(word, exercise, current_ts, horizon)
+        return r_no_review, r_after_success, r_after_failure
+
     def estimate_erg(self, word: Word, exercise: ExerciseType, current_ts: float,
                      horizon: float = 1.0) -> float:
         """
-        Expected Recognition Growth: how much performing this exercise improves
-        expected retrievability at (current_ts + horizon).
-
         ERG = p_success * R(horizon | success) + p_fail * R(horizon | fail) - R(horizon | no review)
         """
-        import copy
-
-        # Base recall probability before context modifiers
-        if not word.seen:
-            r_base = self._first_exposure_recall(word, exercise)
-        else:
-            r_base = self._compute_retrievability(word, current_ts)
-
-        # Success probability including exercise difficulty, fatigue, interference
-        p_success = self._apply_context_modifiers(r_base, word, exercise)
-        p_success = max(0.0, min(1.0, p_success))
-
-        future_ts = current_ts + horizon
-
-        # Retrievability at horizon if we skip this exercise entirely
-        r_no_review = self._compute_retrievability(word, future_ts) if word.seen else 0.0
-
-        # Simulate success (grade=3, GOOD)
-        word_ok = copy.copy(word)
-        self._update_word_state(word_ok, 3, current_ts, r_base)
-        r_after_success = self._compute_retrievability(word_ok, future_ts)
-
-        # Simulate failure (grade=1, AGAIN)
-        word_fail = copy.copy(word)
-        self._update_word_state(word_fail, 1, current_ts, r_base)
-        r_after_failure = self._compute_retrievability(word_fail, future_ts)
-
+        p_success = self.success_probability(word, exercise, current_ts)
+        r_no_review, r_after_success, r_after_failure = self.recognition_estimates(
+            word, exercise, current_ts, horizon
+        )
         return p_success * r_after_success + (1 - p_success) * r_after_failure - r_no_review
+
+    def estimate_sigmoid(self, word: Word, exercise: ExerciseType, current_ts: float,
+                         horizon: float = 1.0) -> float:
+        """
+        Sigmoid-transformed ERG — same formula with shifted-sigmoid applied to each r term.
+        """
+        p_success = self.success_probability(word, exercise, current_ts)
+        r_no_review, r_after_success, r_after_failure = self.recognition_estimates(
+            word, exercise, current_ts, horizon
+        )
+        return (p_success * self._shifted_sigmoid(r_after_success)
+                + (1 - p_success) * self._shifted_sigmoid(r_after_failure)
+                - self._shifted_sigmoid(r_no_review))
 
     @staticmethod
     def _clamp(x, lo, hi):
         return max(lo, min(hi, x))
+    
+    @staticmethod
+    def _shifted_sigmoid(x, shift=0.7, k=5):
+        tanh = np.tanh(k*(x - shift))
+        th_shift = np.tanh(-k * shift)
+        scale = np.tanh(k * 1 - k * shift) - th_shift
+
+        return  (tanh - th_shift) / scale
 
 
 # ============================================================
